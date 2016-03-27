@@ -1,48 +1,117 @@
-use std::borrow::{Cow, Borrow};
-use std::any::Any;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::ops::Deref;
+/// This module is an attempt to figure out how to improve structure of
+/// `collenchyma`.
+///
+/// Reached goals:
+/// - Allow to separate CUDA, OpenCL and Native backends into their own
+///   independent crates. No need to specify features during compilation,
+///   just import `collenchyma-cuda`, `collenchyma-opencl` as required.
+///   This doesn't come for free, though.
+/// - Implement reasonable protection from use of unitialized memory in runtime.
+/// - Don't do syncronization when it's not strictly required. E.g. if copies
+///   on both GPU and CPU are both current, getting read-only references to
+///   any of them won't result in syncronization.
+/// - Allow to skip initialization for write-only buffers.
+/// - Restrict memory mutability in common Rust style: allow only one mutable
+///   "view" (implemeted as `Tensor`), or many immutable views.
+/// - Use type system and borrowck to insure that tensors are syncronized
+///   properly.
+/// - Allow syncs and mem allocations on immutable `SharedTensor`. This allows
+///   to place syncs() closer to use sites, see leaf::layer::sync().
+///
+/// Not reached goals (yet?):
+/// - Currently `Tensor` has no indicator if it's read-only or can be
+///   safely written to. I think its type should be extended with some flag
+///   to allow rust verify mutability automatically. Or can `mut` be somehow
+///   coerced to do this? `SharedTensor` can be modified to hand out mut/immut
+///   references to `Tensor` instead of `Tensor` values, but then it'll have
+///   to keep all `Tensor`s inside. And there'll be problems with reshaping and
+///   slicing.
+/// - It shouldn't be difficult to implement slicing, but that would probably
+///   require implement slicing for memory first. Slicing can be used to cut
+///   number of memory transfers. E.g. solver may need to update scalars for
+///   local learning rate on GPU for each of `N` weight tensors every epoch.
+///   That'll result in `N` 4 byte transfers from host to GPU that could be
+///   replaced with single transfer with slicing.
+/// - Async operations: it looks like currently most time is spent waiting
+///   for in/out transfers even on mid-range GPU hardware. Async may help a lot.
+///
+/// Tradeoffs:
+/// - Moving CUDA and OpenCL stuff completely out of the base crate would remove
+///   conditional compilation (it's evil in general), remove several enums,
+///   wrapping and unwrapping throughout code. On the other side it complicates
+///   interoperation: CUDA backend must know specifics of Native to implement
+///   memory syncronization. I haven't found a way to do this without using
+///   `Any` for dynamic-like typing, and that's quite ugly and wastes extra
+///   CPU cycles. I think added delay is negligible in comparison with
+///   setting up any kind of Host <--> discrete GPU transfer. That said, syncs()
+///   should be very rare: initialize, then upload NN input data and download
+///   output.
 
-pub trait Framework {
-    type D: Clone + Eq + Any;
-    type E;
-    type M: Memory + Any;
+use std::any::Any;
+use std::borrow::{Cow, Borrow};
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::rc::Rc;
+
+/// Should be implemented for `Native`, `Cuda`, `OpenCL`.
+/// `Framework` has 1:1 mapping to `Device` and `Memory` types.
+pub trait Framework
+    where Self: Any {
+
+    type D: Clone + Eq + Any + MemoryTransfer;
+    type M: Any;
 
     fn allocate_memory(&Self::D, usize) -> Result<Self::M, Error>;
 }
 
-trait MemoryTransfer {
-    type F: Framework;
+/// This trait should be implemented for `Device`.
+/// Use of `Any` everywhere is ugly, but it looks like there is no other way
+/// to do it if we want to extract CUDA stuff into its own crate completely,
+/// so that base crate knows nothing about it at all.
+pub trait MemoryTransfer {
+    fn can_transfer_from(&self, src_device: &Any) -> bool;
+    fn can_transfer_to(&self, dst_device: &Any) -> bool;
 
-    fn can_transfer_to<FD: Framework>() -> bool;
-    fn transfer_to<FD: Framework>(&Self, memory: F::M) -> Result<(), Error>;
+    fn transfer_from(&self, my_memory: &Any, dst_device: &Any, dst_memory: &Any)
+                     -> Result<(), Error>;
+    fn transfer_to(&self, my_memory: &Any, src_device: &Any, src_memory: &Any)
+                   -> Result<(), Error>;
 }
 
-// trait Device {
-//     type M;
-// }
-
-
-pub struct Tensor<'a, F: Framework> {
-    dim: Cow<'a, [usize]>,
-    memory: Rc<F::M>,
-}
-
+/// Stub for `Error` type.
 pub enum Error {
     UninitializedMemory,
     AllocationFailed,
+    NoMemoryTransferRoute,
 }
 
+/// `Tensor` located on a specific device.
+/// It's possible to extend it to allow slicing if slice memory is continuous.
+pub struct Tensor<'a, F: Framework> {
+    dim: Cow<'a, [usize]>,
+    device: F::D,
+    memory: Rc<Any>,
+    _framework: PhantomData<F>,
+}
+
+/// Unsigned integer type that keeps version of memory location.
+/// Each time when ``Tensor` is mutably borrowed from `SharedTensor`, version
+/// of corresponding memory is increased.
+/// Value `0` has special meaning: it means that memory location wasn't
+/// initialized yet.
 type Version = u32;
 
+/// Helper type that keeps full description of memory location.
+/// It's not part of API.
 struct TensorLocation {
     device: Box<Any>,
     version: Version,
     mem: Rc<Any>,
 }
 
-
+/// `SharedTensor` keeps track of all memory locations and their versions
+/// and does memory transfers when they are required.
 pub struct SharedTensor {
     dim: Vec<usize>,
 
@@ -60,8 +129,11 @@ impl SharedTensor {
         }
     }
 
-    pub fn size(self) -> usize {
-        1 // FIXME
+    /// I suggest putting all `collenchyma::TensorDesc` methods directly on
+    /// `SharedTensor` and `Tensor`. Doing `x.desc().size()` is overly verbose.
+    /// This can be implemented via additional trait or as macros.
+    pub fn size(&self) -> usize {
+        unimplemented!()
     }
 
     /// Looks up `device` in self.locations and returns its index. If lookup
@@ -86,41 +158,81 @@ impl SharedTensor {
     /// TODO: chose the best source to copy data from.
     /// That would require some additional traits that return costs for
     /// transferring data between different backends.
-    fn update_if_needed<F: Framework>(&self, device: &F::D, dest_i: usize)
+    /// Actually I think that there would be only transfers between
+    /// `Native` <-> `Cuda` and `Native` <-> `OpenCL` in foreseeable future,
+    /// so it's best to not overengineer here.
+    fn update_if_needed<F: Framework>(&self, device: &F::D, dst_i: usize)
                                       -> Result<(), Error> {
         let locs = self.locations.borrow_mut();
-        if locs[dest_i].version == self.latest_version {
+        let dst_loc = &locs[dst_i];
+        if dst_loc.version == self.latest_version {
             return Ok(());
         }
 
-        let src_i = locs.iter().enumerate()
-            .filter(|&(i, ref loc)| loc.version == self.latest_version)
+        // TODO: filter out impossible transfers
+        let src_loc = locs.iter()
+            .filter(|loc| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
 
+        let src_device = src_loc.device.deref().downcast_ref::<&MemoryTransfer>()
+            .expect("broken invariant: object doesn't support mem transfers");
+        let dst_device = dst_loc.device.deref().downcast_ref::<&MemoryTransfer>()
+            .expect("broken invariant: object doesn't support mem transfers");
+
+        if src_device.can_transfer_to(&dst_loc.device) {
+            src_device.transfer_to(&src_loc.mem, &dst_loc.device, &dst_loc.mem)
+        } else if src_device.can_transfer_to(&dst_loc.device) {
+            dst_device.transfer_from(&dst_loc.device, &src_loc.device, &src_loc.mem)
+        } else {
+            // TODO: fallback on indirect transfer via Native
+            Err(Error::NoMemoryTransferRoute)
+        }
     }
 
-
-
+    /// Get tensor for reading on the specified `device`.
+    /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
     pub fn read<'a, F: Framework>(&'a self, device: &F::D)
                                   -> Result<Tensor<'a, F>, Error> {
         if self.latest_version == 0 {
             return Err(Error::UninitializedMemory);
         }
-        let i = try!(self.get_location_index(device));
-        try!(self.update_if_needed(device, i));
+        let i = try!(self.get_location_index::<F>(device));
+        try!(self.update_if_needed::<F>(device, i));
 
+        let loc = &self.locations.borrow()[i];
         Ok(Tensor {
-            dim: Cow::Borrowed(&self.dim)
+            dim: Cow::Borrowed(&self.dim),
+            memory: loc.mem.clone(),
+            device: device.clone(),
+            _framework: PhantomData {},
         })
     }
 
-    // pub fn read_write<'a>(&'a mut self, device: &Device) -> Result<Tensor<'a>, Error> {
-    //     Ok(Tensor {dim: Cow::Borrowed(&self.dim)})
-    // }
+    /// Get tensor for reading and writing on the specified `device`.
+    /// This memory location is set as latest.
+    /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
+    pub fn read_write<'a, F: Framework>(&'a self, device: &F::D)
+                                        -> Result<Tensor<'a, F>, Error> {
+        unimplemented!();
+    }
 
-    // pub fn write_only<'a>(&'a mut self, device: &Device) -> Result<Tensor<'a>, Error> {
-    //     Ok(Tensor {dim: Cow::Borrowed(&self.dim)})
-    // }
+    /// Get tensor for writing only.
+    /// This function skips syncronization and initialization logic, since
+    /// contents will be overwritten anyway. Caller must initialize all elements
+    /// of this tensor. This convention isn't enforced, and failure to do so
+    /// may result in use of undefined data later.
+    /// If caller has failed to overwrite memory, it must call `invalidate()`
+    /// to return vector to uninitialized state.
+    pub fn write_only<'a, F: Framework>(&mut 'a self, device: &F::D)
+                                        -> Result<Tensor<'a, F>, Error> {
+        unimplemented!();
+    }
+
+    /// Invalidate data at all memory locations. This function only marks
+    /// memory as invalid and doen't deallocate anything.
+    pub fn invalidate(&self) {
+        unimplemented!();
+    }
 }
 
 
