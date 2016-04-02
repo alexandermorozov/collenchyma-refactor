@@ -1,19 +1,19 @@
 /// This module is an attempt to figure out how to improve structure of
 /// `collenchyma`.
 ///
-/// Reached goals:
+/// Complete:
 /// - Allow to separate CUDA, OpenCL and Native backends into their own
 ///   independent crates. No need to specify features during compilation,
 ///   just import `collenchyma-cuda`, `collenchyma-opencl` as required.
 ///   This doesn't come for free, though.
 /// - Implement reasonable protection from use of unitialized memory in runtime.
-/// - Don't do syncronization when it's not strictly required. E.g. if copies
+/// - Don't do synchronization when it's not strictly required. E.g. if copies
 ///   on both GPU and CPU are both current, getting read-only references to
-///   any of them won't result in syncronization.
+///   any of them won't result in synchronization.
 /// - Allow to skip initialization for write-only buffers.
 /// - Restrict memory mutability in common Rust style: allow only one mutable
 ///   "view" (implemeted as `Tensor`), or many immutable views.
-/// - Use type system and borrowck to insure that tensors are syncronized
+/// - Use type system and borrowck to insure that tensors are synchronized
 ///   properly.
 /// - Allow syncs and mem allocations on immutable `SharedTensor`. This allows
 ///   to place syncs() closer to use sites, see leaf::layer::sync().
@@ -25,8 +25,7 @@
 /// - `Tensor` and `MutTensor` can be reshaped in-place. Reshaping doesn't
 ///   affect their parent `SharedTensor`.
 ///
-///
-/// Not reached goals (yet?):
+/// Possible:
 /// - It shouldn't be difficult to implement slicing, but that would probably
 ///   require implementing slicing for memory first. Slicing can be used to cut
 ///   number of memory transfers. E.g. solver may need to update scalars for
@@ -35,13 +34,17 @@
 ///   replaced with single transfer with slicing.
 /// - Async operations: it looks like currently most time is spent waiting
 ///   for in/out transfers even on mid-range GPU hardware. Async may help a lot.
+///   Async can be implemented by making transfer_to/transfer_from to return
+///   an object that can be waited on until transfer completes. Later
+///   `Tensor::get_memory()` could block until transfer completes when
+///   direction is e.g. CUDA -> Host.
 ///
 /// Tradeoffs:
 /// - Moving CUDA and OpenCL stuff completely out of the base crate would remove
 ///   conditional compilation (it's evil in general), remove several enums,
 ///   wrapping and unwrapping throughout code. On the other side it complicates
 ///   interoperation: CUDA backend must know specifics of Native to implement
-///   memory syncronization. I haven't found a way to do this without using
+///   memory synchronization. I haven't found a way to do this without using
 ///   `Any` for dynamic-like typing, and that's quite ugly and wastes extra
 ///   CPU cycles. I think added delay is negligible in comparison with
 ///   setting up any kind of Host <--> discrete GPU transfer. That said, syncs()
@@ -255,7 +258,7 @@ impl SharedTensor {
     }
 
     /// Get tensor for writing only.
-    /// This function skips syncronization and initialization logic, since
+    /// This function skips synchronization and initialization logic, since
     /// contents will be overwritten anyway. Caller must initialize all elements
     /// of this tensor. This convention isn't enforced, and failure to do so
     /// may result in use of undefined data later.
