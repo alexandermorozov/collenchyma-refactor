@@ -27,7 +27,7 @@
 ///   to keep all `Tensor`s inside. And there'll be problems with reshaping and
 ///   slicing.
 /// - It shouldn't be difficult to implement slicing, but that would probably
-///   require implement slicing for memory first. Slicing can be used to cut
+///   require implementing slicing for memory first. Slicing can be used to cut
 ///   number of memory transfers. E.g. solver may need to update scalars for
 ///   local learning rate on GPU for each of `N` weight tensors every epoch.
 ///   That'll result in `N` 4 byte transfers from host to GPU that could be
@@ -49,21 +49,11 @@
 
 use std::any::Any;
 use std::borrow::{Cow, Borrow};
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::Rc;
 
-/// Should be implemented for `Native`, `Cuda`, `OpenCL`.
-/// `Framework` has 1:1 mapping to `Device` and `Memory` types.
-pub trait Framework
-    where Self: Any {
-
-    type D: Clone + Eq + Any + MemoryTransfer;
-    type M: Any;
-
-    fn allocate_memory(&Self::D, usize) -> Result<Self::M, Error>;
-}
 
 /// This trait should be implemented for `Device`.
 /// Use of `Any` everywhere is ugly, but it looks like there is no other way
@@ -79,6 +69,15 @@ pub trait MemoryTransfer {
                    -> Result<(), Error>;
 }
 
+pub trait Device
+    where Self: Clone + Eq + Any {
+
+    type M: Any;
+    fn allocate_memory(&Self, usize) -> Result<Self::M, Error>;
+}
+
+
+
 /// Stub for `Error` type.
 pub enum Error {
     UninitializedMemory,
@@ -88,11 +87,10 @@ pub enum Error {
 
 /// `Tensor` located on a specific device.
 /// It's possible to extend it to allow slicing if slice memory is continuous.
-pub struct Tensor<'a, F: Framework> {
+pub struct Tensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
-    device: F::D,
-    memory: Rc<Any>,
-    _framework: PhantomData<F>,
+    device: D,
+    memory: Ref<'a, D::M>,
 }
 
 /// Unsigned integer type that keeps version of memory location.
@@ -137,11 +135,11 @@ impl SharedTensor {
     }
 
     /// Looks up `device` in self.locations and returns its index. If lookup
-    /// fails then new location is created.
-    fn get_location_index<F: Framework>(&self, device: &F::D)
-                                        -> Result<usize, Error> {
+    /// fails then new location is created and its index is returned.
+    fn get_location_index<D: Device>(&self, device: &D)
+                                     -> Result<usize, Error> {
         for (i, loc) in self.locations.borrow().iter().enumerate() {
-            match loc.device.deref().downcast_ref::<&F::D>() {
+            match loc.device.deref().downcast_ref::<&D>() {
                 Some(ref d) if **d == device => return Ok(i),
                 _ => {},
             }
@@ -150,7 +148,7 @@ impl SharedTensor {
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
             version: 0,
-            mem: Rc::new(try!(F::allocate_memory(device, self.size()))),
+            mem: Rc::new(try!(D::allocate_memory(device, self.size()))),
         });
         Ok(self.locations.borrow().len() - 1)
     }
@@ -161,8 +159,8 @@ impl SharedTensor {
     /// Actually I think that there would be only transfers between
     /// `Native` <-> `Cuda` and `Native` <-> `OpenCL` in foreseeable future,
     /// so it's best to not overengineer here.
-    fn update_if_needed<F: Framework>(&self, device: &F::D, dst_i: usize)
-                                      -> Result<(), Error> {
+    fn update_if_needed<D: Device>(&self, device: &D, dst_i: usize)
+                                   -> Result<(), Error> {
         let locs = self.locations.borrow_mut();
         let dst_loc = &locs[dst_i];
         if dst_loc.version == self.latest_version {
@@ -191,28 +189,29 @@ impl SharedTensor {
 
     /// Get tensor for reading on the specified `device`.
     /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
-    pub fn read<'a, F: Framework>(&'a self, device: &F::D)
-                                  -> Result<Tensor<'a, F>, Error> {
+    pub fn read<'a, D: Device>(&'a self, device: &D)
+                               -> Result<Tensor<'a, D>, Error> {
         if self.latest_version == 0 {
             return Err(Error::UninitializedMemory);
         }
-        let i = try!(self.get_location_index::<F>(device));
-        try!(self.update_if_needed::<F>(device, i));
+        let i = try!(self.get_location_index::<D>(device));
+        try!(self.update_if_needed::<D>(device, i));
 
-        let loc = &self.locations.borrow()[i];
+        let locs = self.locations.borrow();
         Ok(Tensor {
             dim: Cow::Borrowed(&self.dim),
-            memory: loc.mem.clone(),
+            memory: Ref::map(locs,
+                             |ls| ls[i].mem.deref().downcast_ref::<D::M>()
+                             .expect("Wrong mem type")),
             device: device.clone(),
-            _framework: PhantomData {},
         })
     }
 
     /// Get tensor for reading and writing on the specified `device`.
     /// This memory location is set as latest.
     /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
-    pub fn read_write<'a, F: Framework>(&'a self, device: &F::D)
-                                        -> Result<Tensor<'a, F>, Error> {
+    pub fn read_write<'a, D: Device>(&'a self, device: &D)
+                                     -> Result<Tensor<'a, D>, Error> {
         unimplemented!();
     }
 
@@ -223,28 +222,72 @@ impl SharedTensor {
     /// may result in use of undefined data later.
     /// If caller has failed to overwrite memory, it must call `invalidate()`
     /// to return vector to uninitialized state.
-    pub fn write_only<'a, F: Framework>(&mut 'a self, device: &F::D)
-                                        -> Result<Tensor<'a, F>, Error> {
+    pub fn write_only<'a, D: Device>(&'a mut self, device: &D)
+                                     -> Result<Tensor<'a, D>, Error> {
         unimplemented!();
     }
 
     /// Invalidate data at all memory locations. This function only marks
     /// memory as invalid and doen't deallocate anything.
-    pub fn invalidate(&self) {
+    pub fn invalidate(&mut self) {
         unimplemented!();
     }
 }
 
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     #[test]
-//     fn it_works() {
-//         let dev = Device {name: "cuda".to_string()};
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use super::*;
 
-//         let mut shared = SharedTensor::new(vec![1,2,3]);
-//         let t1 = shared.read(&dev);
-//         // let tmut = shared.write_only(&dev);
-//     }
-// }
+    #[derive(PartialEq, Eq, Clone)]
+    struct CpuDevice {
+        index: usize,
+    }
+
+    struct HostMemory {
+        data: Vec<u8>
+    }
+
+    impl Device for CpuDevice {
+        type M = HostMemory;
+
+        fn allocate_memory(_dev: &Self, size: usize) -> Result<Self::M, Error> {
+            Ok(HostMemory {
+                data: vec![0; size]
+            })
+        }
+    }
+
+    impl MemoryTransfer for CpuDevice {
+        fn can_transfer_from(&self, src_device: &Any) -> bool {
+            false
+        }
+
+        fn can_transfer_to(&self, dst_device: &Any) -> bool {
+            false
+        }
+
+        fn transfer_from(&self, my_memory: &Any, dst_device: &Any, dst_memory: &Any)
+                         -> Result<(), Error> {
+            unimplemented!();
+        }
+
+        fn transfer_to(&self, my_memory: &Any, src_device: &Any, src_memory: &Any)
+                    -> Result<(), Error> {
+            unimplemented!();
+        }
+    }
+
+
+    #[test]
+    fn it_works() {
+        let mut shared = SharedTensor::new(vec![1,2,3]);
+
+        let dev = CpuDevice {index: 0};
+        let t1 = shared.read(&dev);
+        let t2 = shared.read(&dev);
+        // let tmut = shared.write_only(&dev);
+        // let tmut2 = shared.write_only(&dev);
+    }
+}
