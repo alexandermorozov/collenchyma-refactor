@@ -6,26 +6,32 @@
 ///   independent crates. No need to specify features during compilation,
 ///   just import `collenchyma-cuda`, `collenchyma-opencl` as required.
 ///   This doesn't come for free, though.
-/// - Implement reasonable protection from use of unitialized memory in runtime.
+/// - Keep currently implemented restriction on memory mutability: allow only
+///   one mutable "view" of `SharedTensor` (implemeted as `MutTensor`), or many
+///   immutable views (`Tensor`). Since all comutations are done only on `Tensor`
+///   and `MutTensor` there should be no data races.
 /// - Don't do synchronization when it's not strictly required. E.g. if copies
-///   on both GPU and CPU are both current, getting read-only references to
-///   any of them won't result in synchronization.
-/// - Allow to skip initialization for write-only buffers.
-/// - Restrict memory mutability in common Rust style: allow only one mutable
-///   "view" (implemeted as `Tensor`), or many immutable views.
-/// - Use type system and borrowck to insure that tensors are synchronized
-///   properly.
-/// - Allow syncs and mem allocations on immutable `SharedTensor`. This allows
-///   to place syncs() closer to use sites, see leaf::layer::sync().
-/// - All computations are done on `Tensor` and `MutTensor`. `Tensor` backed by
-///   immutable memory and `MutTensor` is backed by mutable memory. Mutability
-///   of contents are enforced by Rust's type system.
+///   on both GPU and CPU are current, getting read references to any of them
+///   won't result in redundant transfers.
+/// - Implement lightweight protection from use of unitialized memory in
+///   runtime.
+/// - Skip initialization for write-only views.
+/// - Allow syncs and mem allocations on immutable `SharedTensor`. Now it needs
+///   to be mutable only for shape and data mutation and data invalidation.
 /// - `Tensor` and `MutTensor` are parametrized on backend driver and give out
-///   typed memory on request, so there is no need to use .as_native(), etc.
-/// - `Tensor` and `MutTensor` can be reshaped in-place. Reshaping doesn't
-///   affect their parent `SharedTensor`.
+///   typed memory on request, so there is no need to use .as_native().unwrap(),
+///   etc. If device was Native, mem has to be Native also. Additionally it also
+///   makes impossilbe to pass Native memory to Cuda backend operations.
+/// - Both `Tensor` and `MutTensor` can be reshaped in-place. Reshaping doesn't
+///   affect their parent `SharedTensor`. There is quite a lot of reshaping in
+///   Leaf code, so it's nice to have special support for it.
 ///
 /// Possible:
+/// - I'd suggest implementing everything related to dimensions directly on
+///   `Tensor`, `MutTensor` and `SharedTensor`. It would shorten
+///   `x.desc().dim()` to `x.dim()`. The calls are quite common and I think
+///   it's worth doing. More importantly it also removes `TensorDesc` entity
+///   and reduces mental load.
 /// - It shouldn't be difficult to implement slicing, but that would probably
 ///   require implementing slicing for memory first. Slicing can be used to cut
 ///   number of memory transfers. E.g. solver may need to update scalars for
@@ -35,9 +41,12 @@
 /// - Async operations: it looks like currently most time is spent waiting
 ///   for in/out transfers even on mid-range GPU hardware. Async may help a lot.
 ///   Async can be implemented by making transfer_to/transfer_from to return
-///   an object that can be waited on until transfer completes. Later
-///   `Tensor::get_memory()` could block until transfer completes when
-///   direction is e.g. CUDA -> Host.
+///   an object that can be waited on until transfer completes when sync
+///   is required, e.g. CUDA -> Host. `Tensor::get_memory()` could block
+///   until transfer completes.
+/// - Currently code assumes that cloning `Device` is cheap. It's possible
+///   to replace copy with a pointer in `Tensor` and `MutTensor`, if it's a
+///   problem.
 ///
 /// Tradeoffs:
 /// - Moving CUDA and OpenCL stuff completely out of the base crate would remove
@@ -61,6 +70,13 @@
 ///   possible to write code like this with good user interface, that
 ///   doesn't allocate each time and doesn't use additional traits and
 ///   inderection.
+/// - Code in Leaf reshapes input tensors every forward pass. It's possible
+///   to share memory allocations between several `SharedTensor`s and allow
+///   each one have its own shape. But that would complicate internals a lot.
+///   Data race policies (mut/immut borrows) would have to be checked in
+///   runtime (currently they are checked at compile time). It would also
+///   complicate mental model a lot since several tensors would magically share
+///   the same content and this destroys locality.
 
 use std::any::Any;
 use std::borrow::{Cow, Borrow};
@@ -103,6 +119,7 @@ pub enum Error {
 
 /// `Tensor` located on a specific device.
 /// It's possible to extend it to allow slicing if slice memory is continuous.
+/// Data referred by this tensor is immutable while shape is mutable.
 /// TODO: define methods like reshape(), get_mem(), etc.
 pub struct Tensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
@@ -111,7 +128,7 @@ pub struct Tensor<'a, D: Device> {
 }
 
 /// `MutTensor` located on a specific device.
-/// It's possible to extend it to allow slicing if slice memory is continuous.
+/// Data referred by this tensor and its shape are mutable.
 /// TODO: define methods like reshape(), get_mem(), .get_mut_mem(), .fill(), etc.
 pub struct MutTensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
@@ -136,6 +153,7 @@ struct TensorLocation {
 
 /// `SharedTensor` keeps track of all memory locations and their versions
 /// and does memory transfers when they are required.
+/// TODO: impl resize(), reshape(), etc.
 pub struct SharedTensor {
     dim: Vec<usize>,
 
@@ -168,19 +186,9 @@ impl SharedTensor {
             match loc.device.deref().downcast_ref::<D>() {
                 Some(ref d) if *d == device => return Ok(i),
                 _ => {}
-                // Some(ref d) => {
-                //     if *d == device {
-                //         return Ok(i);
-                //     } else {
-                //         println!("devs differ: {:?} != {:?}", *d, device);
-                //     }
-                // },
-                // _ => {
-                //     println!("downcast failed!");
-                // },
             }
         }
-        println!("Add new device");
+
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
             version: 0,
@@ -208,7 +216,6 @@ impl SharedTensor {
             .filter(|&(_, loc)| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
 
-        println!("src_i={} dst_i={}", src_i, dst_i);
         if src_i == dst_i {
             return Ok(());
         }
@@ -243,7 +250,7 @@ impl SharedTensor {
             dim: Cow::Borrowed(&self.dim),
             memory: Ref::map(locs,
                              |ls| ls[i].mem.deref().downcast_ref::<D::M>()
-                             .expect("Wrong mem type")),
+                             .expect("Broken invariant: wrong memory type")),
             device: device.clone(),
         })
     }
@@ -278,7 +285,7 @@ impl SharedTensor {
             memory: RefMut::map(locs,
                                 |ls| ls[i].mem.as_mut()
                                 .downcast_mut::<D::M>()
-                                .expect("Wrong mem type")),
+                                .expect("Broken invariant: wrong memory type")),
             device: device.clone(),
         })
     }
