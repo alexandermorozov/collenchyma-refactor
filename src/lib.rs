@@ -48,6 +48,11 @@
 ///   to replace copy with a pointer in `Tensor` and `MutTensor`, if it's a
 ///   problem.
 ///
+/// Not implemented:
+/// - while currently it's not possible to mismatch tensors with different
+///   device types, it's still possible to cause mismatch with different
+///   devices of one type. Can something be done about it?
+///
 /// Tradeoffs:
 /// - Moving CUDA and OpenCL stuff completely out of the base crate would remove
 ///   conditional compilation (it's evil in general), remove several enums,
@@ -312,6 +317,17 @@ mod tests {
         data: Vec<u8>
     }
 
+    impl HostMemory {
+        // Toy impl just to test that it works
+        fn as_slice(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn as_mut_slice(&mut self) -> &mut [u8] {
+            &mut self.data
+        }
+    }
+
     impl Device for CpuDevice {
         type M = HostMemory;
 
@@ -348,8 +364,23 @@ mod tests {
         let mut shared = SharedTensor::new(vec![1,2,3]);
 
         let dev = CpuDevice {index: 0};
-        // let t1 = shared.read(&dev);
-        // let t2 = shared.read(&dev);
+        // let t0 = shared.read(&dev);
+
+        {
+            let mut t1 = shared.write_only(&dev).unwrap();
+            for x in t1.mut_mem().as_mut_slice() {
+                *x = 11;
+            }
+        }
+
+        {
+            let t2 = shared.read(&dev).unwrap();
+            let t3 = shared.read(&dev).unwrap();
+            let t2_mem = t2.mem();
+            println!("mem {:?}", t2_mem);
+            // println!("mem {:?}", shared.read(&dev).unwrap().mem());
+        }
+
         {
             let tmut = shared.write_only(&dev);
         }
