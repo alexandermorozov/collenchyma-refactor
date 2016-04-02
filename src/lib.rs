@@ -68,7 +68,6 @@ use std::cell::{Ref, RefMut, RefCell};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::rc::Rc;
 
 
 /// This trait should be implemented for `Device`.
@@ -132,7 +131,7 @@ type Version = u32;
 struct TensorLocation {
     device: Box<Any>,
     version: Version,
-    mem: Rc<Any>,
+    mem: Box<Any>,
 }
 
 /// `SharedTensor` keeps track of all memory locations and their versions
@@ -185,7 +184,7 @@ impl SharedTensor {
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
             version: 0,
-            mem: Rc::new(try!(D::allocate_memory(device, self.size()))),
+            mem: Box::new(try!(D::allocate_memory(device, self.size()))),
         });
         Ok(self.locations.borrow().len() - 1)
     }
@@ -277,7 +276,7 @@ impl SharedTensor {
         Ok(MutTensor {
             dim: Cow::Borrowed(&self.dim),
             memory: RefMut::map(locs,
-                                |ls| Rc::get_mut(&mut ls[i].mem).unwrap()
+                                |ls| ls[i].mem.as_mut()
                                 .downcast_mut::<D::M>()
                                 .expect("Wrong mem type")),
             device: device.clone(),
