@@ -17,15 +17,16 @@
 ///   properly.
 /// - Allow syncs and mem allocations on immutable `SharedTensor`. This allows
 ///   to place syncs() closer to use sites, see leaf::layer::sync().
+/// - All computations are done on `Tensor` and `MutTensor`. `Tensor` backed by
+///   immutable memory and `MutTensor` is backed by mutable memory. Mutability
+///   of contents are enforced by Rust's type system.
+/// - `Tensor` and `MutTensor` are parametrized on backend driver and give out
+///   typed memory on request, so there is no need to use .as_native(), etc.
+/// - `Tensor` and `MutTensor` can be reshaped in-place. Reshaping doesn't
+///   affect their parent `SharedTensor`.
+///
 ///
 /// Not reached goals (yet?):
-/// - Currently `Tensor` has no indicator if it's read-only or can be
-///   safely written to. I think its type should be extended with some flag
-///   to allow rust verify mutability automatically. Or can `mut` be somehow
-///   coerced to do this? `SharedTensor` can be modified to hand out mut/immut
-///   references to `Tensor` instead of `Tensor` values, but then it'll have
-///   to keep all `Tensor`s inside. And there'll be problems with reshaping and
-///   slicing.
 /// - It shouldn't be difficult to implement slicing, but that would probably
 ///   require implementing slicing for memory first. Slicing can be used to cut
 ///   number of memory transfers. E.g. solver may need to update scalars for
@@ -46,10 +47,22 @@
 ///   setting up any kind of Host <--> discrete GPU transfer. That said, syncs()
 ///   should be very rare: initialize, then upload NN input data and download
 ///   output.
+/// - tensor objects need to have two types of mutability: one to allow reshaping,
+///   another to indicate if underlying mem is mutable. Currently former is
+///   achived with Rust's usual mutability rules, and latter is implemented with
+///   split into `Tensor` and `MutTensor`. I feel like `Tensor` and `MutTensor`
+///   can be combined if e.g. `SharedTensor::read()` returns `&Tensor` instead
+///   of `Tensor`. In order to do that, `SharedTensor` must own Tensors.
+///   And `Tensor::reshape()` will have to return a new object that again
+///   is owned by the same parent `SharedTensor`... It may or may not be
+///   possible to write code like this with good user interface, that
+///   doesn't allocate each time and doesn't use additional traits and
+///   inderection.
 
 use std::any::Any;
 use std::borrow::{Cow, Borrow};
-use std::cell::{Ref, RefCell};
+use std::cell::{Ref, RefMut, RefCell};
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -70,7 +83,7 @@ pub trait MemoryTransfer {
 }
 
 pub trait Device
-    where Self: Clone + Eq + Any {
+    where Self: Clone + Eq + Any + Debug {
 
     type M: Any;
     fn allocate_memory(&Self, usize) -> Result<Self::M, Error>;
@@ -79,6 +92,7 @@ pub trait Device
 
 
 /// Stub for `Error` type.
+#[derive(Debug)]
 pub enum Error {
     UninitializedMemory,
     AllocationFailed,
@@ -87,10 +101,20 @@ pub enum Error {
 
 /// `Tensor` located on a specific device.
 /// It's possible to extend it to allow slicing if slice memory is continuous.
+/// TODO: define methods like reshape(), get_mem(), etc.
 pub struct Tensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
     device: D,
     memory: Ref<'a, D::M>,
+}
+
+/// `MutTensor` located on a specific device.
+/// It's possible to extend it to allow slicing if slice memory is continuous.
+/// TODO: define methods like reshape(), get_mem(), .get_mut_mem(), .fill(), etc.
+pub struct MutTensor<'a, D: Device> {
+    dim: Cow<'a, [usize]>,
+    device: D,
+    memory: RefMut<'a, D::M>,
 }
 
 /// Unsigned integer type that keeps version of memory location.
@@ -131,7 +155,7 @@ impl SharedTensor {
     /// `SharedTensor` and `Tensor`. Doing `x.desc().size()` is overly verbose.
     /// This can be implemented via additional trait or as macros.
     pub fn size(&self) -> usize {
-        unimplemented!()
+        self.dim.iter().fold(1, |s, &x| s * x)
     }
 
     /// Looks up `device` in self.locations and returns its index. If lookup
@@ -139,12 +163,22 @@ impl SharedTensor {
     fn get_location_index<D: Device>(&self, device: &D)
                                      -> Result<usize, Error> {
         for (i, loc) in self.locations.borrow().iter().enumerate() {
-            match loc.device.deref().downcast_ref::<&D>() {
-                Some(ref d) if **d == device => return Ok(i),
-                _ => {},
+            match loc.device.deref().downcast_ref::<D>() {
+                Some(ref d) if *d == device => return Ok(i),
+                _ => {}
+                // Some(ref d) => {
+                //     if *d == device {
+                //         return Ok(i);
+                //     } else {
+                //         println!("devs differ: {:?} != {:?}", *d, device);
+                //     }
+                // },
+                // _ => {
+                //     println!("downcast failed!");
+                // },
             }
         }
-
+        println!("Add new device");
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
             version: 0,
@@ -168,9 +202,14 @@ impl SharedTensor {
         }
 
         // TODO: filter out impossible transfers
-        let src_loc = locs.iter()
-            .filter(|loc| loc.version == self.latest_version)
+        let (src_i, src_loc) = locs.iter().enumerate()
+            .filter(|&(_, loc)| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
+
+        println!("src_i={} dst_i={}", src_i, dst_i);
+        if src_i == dst_i {
+            return Ok(());
+        }
 
         let src_device = src_loc.device.deref().downcast_ref::<&MemoryTransfer>()
             .expect("broken invariant: object doesn't support mem transfers");
@@ -223,8 +262,23 @@ impl SharedTensor {
     /// If caller has failed to overwrite memory, it must call `invalidate()`
     /// to return vector to uninitialized state.
     pub fn write_only<'a, D: Device>(&'a mut self, device: &D)
-                                     -> Result<Tensor<'a, D>, Error> {
-        unimplemented!();
+                                     -> Result<MutTensor<'a, D>, Error> {
+        let i = try!(self.get_location_index::<D>(device));
+
+        let mut locs = self.locations.borrow_mut();
+
+        // FIXME: properly wrap versions on overflow
+        self.latest_version += 1;
+        locs[i].version += self.latest_version;
+
+        Ok(MutTensor {
+            dim: Cow::Borrowed(&self.dim),
+            memory: RefMut::map(locs,
+                                |ls| Rc::get_mut(&mut ls[i].mem).unwrap()
+                                .downcast_mut::<D::M>()
+                                .expect("Wrong mem type")),
+            device: device.clone(),
+        })
     }
 
     /// Invalidate data at all memory locations. This function only marks
@@ -240,7 +294,7 @@ mod tests {
     use std::any::Any;
     use super::*;
 
-    #[derive(PartialEq, Eq, Clone)]
+    #[derive(PartialEq, Eq, Clone, Debug)]
     struct CpuDevice {
         index: usize,
     }
@@ -260,20 +314,20 @@ mod tests {
     }
 
     impl MemoryTransfer for CpuDevice {
-        fn can_transfer_from(&self, src_device: &Any) -> bool {
+        fn can_transfer_from(&self, _src_device: &Any) -> bool {
             false
         }
 
-        fn can_transfer_to(&self, dst_device: &Any) -> bool {
+        fn can_transfer_to(&self, _dst_device: &Any) -> bool {
             false
         }
 
-        fn transfer_from(&self, my_memory: &Any, dst_device: &Any, dst_memory: &Any)
+        fn transfer_from(&self, _my_memory: &Any, _dst_device: &Any, _dst_memory: &Any)
                          -> Result<(), Error> {
             unimplemented!();
         }
 
-        fn transfer_to(&self, my_memory: &Any, src_device: &Any, src_memory: &Any)
+        fn transfer_to(&self, _my_memory: &Any, _src_device: &Any, _src_memory: &Any)
                     -> Result<(), Error> {
             unimplemented!();
         }
@@ -285,9 +339,13 @@ mod tests {
         let mut shared = SharedTensor::new(vec![1,2,3]);
 
         let dev = CpuDevice {index: 0};
-        let t1 = shared.read(&dev);
-        let t2 = shared.read(&dev);
-        // let tmut = shared.write_only(&dev);
+        // let t1 = shared.read(&dev);
+        // let t2 = shared.read(&dev);
+        {
+            let tmut = shared.write_only(&dev);
+        }
+
+        let t2 = shared.read(&dev).unwrap();
         // let tmut2 = shared.write_only(&dev);
     }
 }
