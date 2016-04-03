@@ -40,7 +40,7 @@
 ///   replaced with single transfer with slicing.
 /// - Async operations: it looks like currently most time is spent waiting
 ///   for in/out transfers even on mid-range GPU hardware. Async may help a lot.
-///   Async can be implemented by making transfer_to/transfer_from to return
+///   Async can be implemented by making transfer_in/transfer_out to return
 ///   an object that can be waited on until transfer completes when sync
 ///   is required, e.g. CUDA -> Host. `Tensor::get_memory()` could block
 ///   until transfer completes.
@@ -85,24 +85,21 @@
 
 use std::any::Any;
 use std::borrow::{Cow, Borrow};
-use std::cell::{Ref, RefMut, RefCell};
+use std::cell::RefCell;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::ops::Deref;
 
+pub mod native;
 
 /// This trait should be implemented for `Device`.
 /// Use of `Any` everywhere is ugly, but it looks like there is no other way
 /// to do it if we want to extract CUDA stuff into its own crate completely,
 /// so that base crate knows nothing about it at all.
 pub trait MemoryTransfer {
-    fn can_transfer_from(&self, src_device: &Any) -> bool;
-    fn can_transfer_to(&self, dst_device: &Any) -> bool;
-
-    fn transfer_from(&self, my_memory: &Any, dst_device: &Any, dst_memory: &Any)
-                     -> Result<(), Error>;
-    fn transfer_to(&self, my_memory: &Any, src_device: &Any, src_memory: &Any)
+    fn transfer_in(&self, my_memory: &mut Any, src_device: &Any, src_memory: &Any)
                    -> Result<(), Error>;
+    fn transfer_out(&self, my_memory: &Any, dst_device: &Any, dst_memory: &mut Any)
+                    -> Result<(), Error>;
 }
 
 pub trait Device
@@ -133,7 +130,15 @@ pub struct Tensor<'a, D: Device> {
 }
 
 impl <'a, D: Device> Tensor<'a, D> {
-    fn mem(&'a self) -> &'a D::M {
+    pub fn size(&self) -> usize {
+        self.dim.iter().fold(1, |s, &x| s * x)
+    }
+
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    pub fn mem(&'a self) -> &'a D::M {
         self.memory
     }
 }
@@ -148,7 +153,15 @@ pub struct MutTensor<'a, D: Device> {
 }
 
 impl <'a, D: Device> MutTensor<'a, D> {
-    fn mut_mem(&'a mut self) -> &'a mut D::M {
+    pub fn size(&self) -> usize {
+        self.dim.iter().fold(1, |s, &x| s * x)
+    }
+
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    pub fn mut_mem(&'a mut self) -> &'a mut D::M {
         self.memory
     }
 }
@@ -220,40 +233,50 @@ impl SharedTensor {
     /// Actually I think that there would be only transfers between
     /// `Native` <-> `Cuda` and `Native` <-> `OpenCL` in foreseeable future,
     /// so it's best to not overengineer here.
-    fn update_if_needed<D: Device>(&self, device: &D, dst_i: usize)
+    fn update_if_needed(&self, dst_i: usize)
                                    -> Result<(), Error> {
-        let locs = self.locations.borrow_mut();
-        let dst_loc = &locs[dst_i];
-        if dst_loc.version == self.latest_version {
+        let mut locs = self.locations.borrow_mut();
+        if locs[dst_i].version == self.latest_version {
             return Ok(());
         }
 
-        // TODO: filter out impossible transfers
-        for (i, loc) in locs.iter().enumerate() {
-            println!("i={} ver={} latest={}", i, loc.version, self.latest_version);
-        }
+        // for (i, loc) in locs.iter().enumerate() {
+        //     println!("i={} ver={} latest={}", i, loc.version, self.latest_version);
+        // }
 
-        let (src_i, src_loc) = locs.iter().enumerate()
+        // TODO: filter out impossible transfers
+        let (src_i, _) = locs.iter().enumerate()
             .filter(|&(_, loc)| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
 
-        if src_i == dst_i {
-            return Ok(());
-        }
+        // We need to borrow two different Vec elements: src and mut dst.
+        assert!(src_i != dst_i);
+        let (src_loc, mut dst_loc) = if src_i < dst_i {
+            let (left, right) = locs.split_at_mut(dst_i);
+            (&left[src_i], &mut right[0])
+        } else {
+            let (left, right) = locs.split_at_mut(src_i);
+            (&right[0], &mut left[dst_i])
+        };
 
         let src_device = src_loc.device.deref().downcast_ref::<&MemoryTransfer>()
             .expect("broken invariant: object doesn't support mem transfers");
         let dst_device = dst_loc.device.deref().downcast_ref::<&MemoryTransfer>()
             .expect("broken invariant: object doesn't support mem transfers");
 
-        if src_device.can_transfer_to(&dst_loc.device) {
-            src_device.transfer_to(&src_loc.mem, &dst_loc.device, &dst_loc.mem)
-        } else if src_device.can_transfer_to(&dst_loc.device) {
-            dst_device.transfer_from(&dst_loc.device, &src_loc.device, &src_loc.mem)
-        } else {
-            // TODO: fallback on indirect transfer via Native
-            Err(Error::NoMemoryTransferRoute)
+        match src_device.transfer_out(&src_loc.mem,
+                                      &dst_loc.device, dst_loc.mem.as_mut()) {
+            Err(Error::NoMemoryTransferRoute) => {},
+            x => return x,
         }
+        match dst_device.transfer_in(dst_loc.mem.as_mut(),
+                                     &src_loc.device, &src_loc.mem) {
+            Err(Error::NoMemoryTransferRoute) => {},
+            x => return x,
+        }
+
+        // TODO: fallback on indirect transfer via Native
+        Err(Error::NoMemoryTransferRoute)
     }
 
     /// Get tensor for reading on the specified `device`.
@@ -264,7 +287,7 @@ impl SharedTensor {
             return Err(Error::UninitializedMemory);
         }
         let i = try!(self.get_location_index::<D>(device));
-        try!(self.update_if_needed::<D>(device, i));
+        try!(self.update_if_needed(i));
 
         let locs = self.locations.borrow();
         let mem: &D::M = locs[i].mem.deref().downcast_ref::<D::M>()
@@ -280,7 +303,7 @@ impl SharedTensor {
     /// Get tensor for reading and writing on the specified `device`.
     /// This memory location is set as latest.
     /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
-    pub fn read_write<'a, D: Device>(&'a self, device: &D)
+    pub fn read_write<'a, D: Device>(&'a self, _device: &D)
                                      -> Result<Tensor<'a, D>, Error> {
         unimplemented!();
     }
@@ -322,66 +345,14 @@ impl SharedTensor {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use super::*;
-
-    #[derive(PartialEq, Eq, Clone, Debug)]
-    struct CpuDevice {
-        index: usize,
-    }
-
-    #[derive(Debug)]
-    struct HostMemory {
-        data: Vec<u8>
-    }
-
-    impl HostMemory {
-        // Toy impl just to test that it works
-        fn as_slice(&self) -> &[u8] {
-            &self.data
-        }
-
-        fn as_mut_slice(&mut self) -> &mut [u8] {
-            &mut self.data
-        }
-    }
-
-    impl Device for CpuDevice {
-        type M = HostMemory;
-
-        fn allocate_memory(_dev: &Self, size: usize) -> Result<Self::M, Error> {
-            Ok(HostMemory {
-                data: vec![0; size]
-            })
-        }
-    }
-
-    impl MemoryTransfer for CpuDevice {
-        fn can_transfer_from(&self, _src_device: &Any) -> bool {
-            false
-        }
-
-        fn can_transfer_to(&self, _dst_device: &Any) -> bool {
-            false
-        }
-
-        fn transfer_from(&self, _my_memory: &Any, _dst_device: &Any, _dst_memory: &Any)
-                         -> Result<(), Error> {
-            unimplemented!();
-        }
-
-        fn transfer_to(&self, _my_memory: &Any, _src_device: &Any, _src_memory: &Any)
-                    -> Result<(), Error> {
-            unimplemented!();
-        }
-    }
-
+    use native::NativeDevice;
 
     #[test]
     fn it_works() {
         let mut shared = SharedTensor::new(vec![1,2,3]);
 
-        let dev = CpuDevice {index: 0};
+        let dev = NativeDevice::new(0);
         // let t0 = shared.read(&dev);
 
         {
@@ -402,7 +373,7 @@ mod tests {
         // let mem = {
         {
             let t2 = shared.read(&dev).unwrap();
-            let t3 = shared.read(&dev).unwrap();
+            let _t3 = shared.read(&dev).unwrap();
             let t2_mem = t2.mem();
             println!("mem {:?}", t2_mem);
             println!("mem {:?}", shared.read(&dev).unwrap().mem());
@@ -411,10 +382,10 @@ mod tests {
         }
 
         {
-            let tmut = shared.write_only(&dev);
+            let _tmut = shared.write_only(&dev);
         }
 
-        let t2 = shared.read(&dev).unwrap();
+        let _t4 = shared.read(&dev).unwrap();
         // let tmut2 = shared.write_only(&dev);
     }
 }
