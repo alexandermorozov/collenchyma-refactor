@@ -1,3 +1,4 @@
+#![feature(get_type_id)]
 /// This module is an attempt to figure out how to improve structure of
 /// `collenchyma`.
 ///
@@ -219,6 +220,12 @@ impl SharedTensor {
             }
         }
 
+        let dev_clone: D = device.clone();
+        {
+            let dev_any: Box<Any> = Box::new(dev_clone);
+            println!("Device={:?} typeid={:?}", dev_any, dev_any.get_type_id());
+        }
+
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
             version: 0,
@@ -244,12 +251,14 @@ impl SharedTensor {
         //     println!("i={} ver={} latest={}", i, loc.version, self.latest_version);
         // }
 
-        // TODO: filter out impossible transfers
+        // TODO: filter out impossible transfers?
         let (src_i, _) = locs.iter().enumerate()
             .filter(|&(_, loc)| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
 
         // We need to borrow two different Vec elements: src and mut dst.
+        // Borrowck doesn't allow to do it in a straightforward way, so
+        // here is the shortest method I could think of.
         assert!(src_i != dst_i);
         let (src_loc, mut dst_loc) = if src_i < dst_i {
             let (left, right) = locs.split_at_mut(dst_i);
@@ -259,22 +268,25 @@ impl SharedTensor {
             (&right[0], &mut left[dst_i])
         };
 
-        let src_device = src_loc.device.deref().downcast_ref::<&MemoryTransfer>()
+        // Backends may define transfers asymmetrically. E. g. CUDA may know how
+        // to transfer to and from Native backend, while Native may know nothing
+        // about CUDA at all. So we try to change device that does transfer
+        // if first attempt fails.
+        let src_device = src_loc.device.deref().downcast_ref::<native::NativeDevice>()
             .expect("broken invariant: object doesn't support mem transfers");
-        let dst_device = dst_loc.device.deref().downcast_ref::<&MemoryTransfer>()
-            .expect("broken invariant: object doesn't support mem transfers");
-
-        match src_device.transfer_out(&src_loc.mem,
-                                      &dst_loc.device, dst_loc.mem.as_mut()) {
+        match src_device.transfer_out(src_loc.mem.deref(),
+                                      dst_loc.device.deref(), dst_loc.mem.as_mut()) {
             Err(Error::NoMemoryTransferRoute) => {},
             x => return x,
         }
+
+        let dst_device = dst_loc.device.deref().downcast_ref::<native::NativeDevice>()
+            .expect("broken invariant: object doesn't support mem transfers");
         match dst_device.transfer_in(dst_loc.mem.as_mut(),
-                                     &src_loc.device, &src_loc.mem) {
+                                     src_loc.device.deref(), src_loc.mem.deref()) {
             Err(Error::NoMemoryTransferRoute) => {},
             x => return x,
         }
-
         // TODO: fallback on indirect transfer via Native
         Err(Error::NoMemoryTransferRoute)
     }
@@ -353,6 +365,9 @@ mod tests {
         let mut shared = SharedTensor::new(vec![1,2,3]);
 
         let dev = NativeDevice::new(0);
+        let dev2 = NativeDevice::new(1);
+        let dev3 = NativeDevice::new(2);
+
         // let t0 = shared.read(&dev);
 
         {
@@ -385,7 +400,10 @@ mod tests {
             let _tmut = shared.write_only(&dev);
         }
 
-        let _t4 = shared.read(&dev).unwrap();
+        // shared.write_only(&dev2);
+        println!("mem at dev2 {:?}", shared.read(&dev2).unwrap().mem());
+        println!("mem at dev3 {:?}", shared.read(&dev3).unwrap().mem());
         // let tmut2 = shared.write_only(&dev);
+        assert!(false);
     }
 }

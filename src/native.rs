@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::any::{Any, TypeId};
 use {Error, MemoryTransfer, Device};
 
 
