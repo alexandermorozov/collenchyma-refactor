@@ -129,7 +129,13 @@ pub enum Error {
 pub struct Tensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
     device: D,
-    memory: Ref<'a, D::M>,
+    memory: &'a D::M,
+}
+
+impl <'a, D: Device> Tensor<'a, D> {
+    fn mem(&'a self) -> &'a D::M {
+        self.memory
+    }
 }
 
 /// `MutTensor` located on a specific device.
@@ -138,7 +144,13 @@ pub struct Tensor<'a, D: Device> {
 pub struct MutTensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
     device: D,
-    memory: RefMut<'a, D::M>,
+    memory: &'a mut D::M,
+}
+
+impl <'a, D: Device> MutTensor<'a, D> {
+    fn mut_mem(&'a mut self) -> &'a mut D::M {
+        self.memory
+    }
 }
 
 /// Unsigned integer type that keeps version of memory location.
@@ -217,6 +229,10 @@ impl SharedTensor {
         }
 
         // TODO: filter out impossible transfers
+        for (i, loc) in locs.iter().enumerate() {
+            println!("i={} ver={} latest={}", i, loc.version, self.latest_version);
+        }
+
         let (src_i, src_loc) = locs.iter().enumerate()
             .filter(|&(_, loc)| loc.version == self.latest_version)
             .next().expect("broken invariant: can't find latest version");
@@ -251,11 +267,12 @@ impl SharedTensor {
         try!(self.update_if_needed::<D>(device, i));
 
         let locs = self.locations.borrow();
+        let mem: &D::M = locs[i].mem.deref().downcast_ref::<D::M>()
+                            .expect("Broken invariant: wrong memory type");
+        let mem_a: &'a D::M = unsafe { ::std::mem::transmute(mem) };
         Ok(Tensor {
             dim: Cow::Borrowed(&self.dim),
-            memory: Ref::map(locs,
-                             |ls| ls[i].mem.deref().downcast_ref::<D::M>()
-                             .expect("Broken invariant: wrong memory type")),
+            memory: mem_a,
             device: device.clone(),
         })
     }
@@ -283,14 +300,14 @@ impl SharedTensor {
 
         // FIXME: properly wrap versions on overflow
         self.latest_version += 1;
-        locs[i].version += self.latest_version;
+        locs[i].version = self.latest_version;
 
+        let mem: &mut D::M = locs[i].mem.as_mut().downcast_mut::<D::M>()
+                            .expect("Broken invariant: wrong memory type");
+        let mem_a: &'a mut D::M = unsafe { ::std::mem::transmute(mem) };
         Ok(MutTensor {
             dim: Cow::Borrowed(&self.dim),
-            memory: RefMut::map(locs,
-                                |ls| ls[i].mem.as_mut()
-                                .downcast_mut::<D::M>()
-                                .expect("Broken invariant: wrong memory type")),
+            memory: mem_a,
             device: device.clone(),
         })
     }
@@ -313,6 +330,7 @@ mod tests {
         index: usize,
     }
 
+    #[derive(Debug)]
     struct HostMemory {
         data: Vec<u8>
     }
@@ -371,13 +389,24 @@ mod tests {
             for x in t1.mut_mem().as_mut_slice() {
                 *x = 11;
             }
+
         }
 
+        {
+            for x in shared.write_only(&dev).unwrap().mut_mem().as_mut_slice() {
+                *x = 11;
+            }
+        }
+
+
+        // let mem = {
         {
             let t2 = shared.read(&dev).unwrap();
             let t3 = shared.read(&dev).unwrap();
             let t2_mem = t2.mem();
             println!("mem {:?}", t2_mem);
+            println!("mem {:?}", shared.read(&dev).unwrap().mem());
+            // t2_mem
             // println!("mem {:?}", shared.read(&dev).unwrap().mem());
         }
 
