@@ -104,7 +104,7 @@ pub trait MemoryTransfer {
 }
 
 pub trait Device
-    where Self: Clone + Eq + Any + Debug {
+    where Self: Clone + Eq + Any + Debug + MemoryTransfer {
 
     type M: Any;
     fn allocate_memory(&Self, usize) -> Result<Self::M, Error>;
@@ -177,7 +177,17 @@ type Version = u32;
 /// Helper type that keeps full description of memory location.
 /// It's not part of API.
 struct TensorLocation {
+    // TODO: both .device and .memory_transfer contain the same device object.
+    // `device` acts as recipient for memory transfers, and `mem_transfer`
+    // acts as initiator. It would be nice to use `Box<Any + MemoryTransfer>1,
+    // but that requires boxing to vtable pointers and isn't currently
+    // possible (E0225). Using `Box<Device>` is impossible too, as this requires
+    // specifying associated type `Device::M`.
+    // It may be possible to manually store device in a box and keep two fat
+    // pointers to its contents, but it's not obvious how to erase type of
+    // the box to store it uniformly.
     device: Box<Any>,
+    mem_transfer: Box<MemoryTransfer>,
     version: Version,
     mem: Box<Any>,
 }
@@ -228,6 +238,7 @@ impl SharedTensor {
 
         self.locations.borrow_mut().push(TensorLocation {
             device: Box::new(device.clone()),
+            mem_transfer: Box::new(device.clone()),
             version: 0,
             mem: Box::new(try!(D::allocate_memory(device, self.size()))),
         });
@@ -258,7 +269,7 @@ impl SharedTensor {
 
         // We need to borrow two different Vec elements: src and mut dst.
         // Borrowck doesn't allow to do it in a straightforward way, so
-        // here is the shortest method I could think of.
+        // here is workaround.
         assert!(src_i != dst_i);
         let (src_loc, mut dst_loc) = if src_i < dst_i {
             let (left, right) = locs.split_at_mut(dst_i);
@@ -270,24 +281,22 @@ impl SharedTensor {
 
         // Backends may define transfers asymmetrically. E. g. CUDA may know how
         // to transfer to and from Native backend, while Native may know nothing
-        // about CUDA at all. So we try to change device that does transfer
-        // if first attempt fails.
-        let src_device = src_loc.device.deref().downcast_ref::<native::NativeDevice>()
-            .expect("broken invariant: object doesn't support mem transfers");
-        match src_device.transfer_out(src_loc.mem.deref(),
-                                      dst_loc.device.deref(), dst_loc.mem.as_mut()) {
+        // about CUDA at all. So if first attempt fails we change order and
+        // try again.
+        match src_loc.mem_transfer.transfer_out(
+            src_loc.mem.deref(), dst_loc.device.deref(), dst_loc.mem.as_mut()) {
             Err(Error::NoMemoryTransferRoute) => {},
             x => return x,
         }
 
-        let dst_device = dst_loc.device.deref().downcast_ref::<native::NativeDevice>()
-            .expect("broken invariant: object doesn't support mem transfers");
-        match dst_device.transfer_in(dst_loc.mem.as_mut(),
-                                     src_loc.device.deref(), src_loc.mem.deref()) {
+        match dst_loc.mem_transfer.transfer_in(
+            dst_loc.mem.as_mut(), src_loc.device.deref(), src_loc.mem.deref()) {
             Err(Error::NoMemoryTransferRoute) => {},
             x => return x,
         }
-        // TODO: fallback on indirect transfer via Native
+
+        // TODO: fallback on indirect transfer via Native, it should generally
+        // work.
         Err(Error::NoMemoryTransferRoute)
     }
 
