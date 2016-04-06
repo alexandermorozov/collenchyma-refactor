@@ -2,6 +2,11 @@
 /// This module is an attempt to figure out how to improve structure of
 /// `collenchyma`.
 ///
+/// TODO:
+/// - Add type parameter to tensors to indicate element type
+/// - Possibly add type parameter to memory? Or upgrade it to parametrized
+///   Slice?
+///
 /// Complete:
 /// - Allow to separate CUDA, OpenCL and Native backends into their own
 ///   independent crates. No need to specify features during compilation,
@@ -113,7 +118,7 @@ pub trait Device
 
 
 /// Stub for `Error` type.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     UninitializedMemory,
     AllocationFailed,
@@ -124,6 +129,7 @@ pub enum Error {
 /// It's possible to extend it to allow slicing if slice memory is continuous.
 /// Data referred by this tensor is immutable while shape is mutable.
 /// TODO: define methods like reshape(), get_mem(), etc.
+#[derive(Debug)]
 pub struct Tensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
     device: D,
@@ -147,6 +153,7 @@ impl <'a, D: Device> Tensor<'a, D> {
 /// `MutTensor` located on a specific device.
 /// Data referred by this tensor and its shape are mutable.
 /// TODO: define methods like reshape(), get_mem(), .get_mut_mem(), .fill(), etc.
+#[derive(Debug)]
 pub struct MutTensor<'a, D: Device> {
     dim: Cow<'a, [usize]>,
     device: D,
@@ -201,6 +208,12 @@ pub struct SharedTensor {
     locations: RefCell<Vec<TensorLocation>>,
 
     latest_version: Version,
+}
+
+impl ::std::fmt::Debug for SharedTensor {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        write!(f, "SharedTensor {:?}", self.dim)
+    }
 }
 
 impl SharedTensor {
