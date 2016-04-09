@@ -6,6 +6,7 @@
 /// - Add type parameter to tensors to indicate element type
 /// - Possibly add type parameter to memory? Or upgrade it to parametrized
 ///   Slice?
+/// - What if Device trait object is passed to read()/write()?
 ///
 /// Complete:
 /// - Allow to separate CUDA, OpenCL and Native backends into their own
@@ -315,6 +316,11 @@ impl SharedTensor {
 
     /// Get tensor for reading on the specified `device`.
     /// Can fail if memory allocation fails, or tensor wasn't initialized yet.
+    // `unsafe` is used to extend lifetime of reference to memory. Borrowck
+    // guarantees that SharedTensor outlives all of its Tensors. So we only
+    // need to make sure that no memory locations are dropped while there
+    // are live Tensors. It's easy to do: by convention we only allow to remove
+    // elements from `self.locations` in methods with `&mut self`.
     pub fn read<'a, D: Device>(&'a self, device: &D)
                                -> Result<Tensor<'a, D>, Error> {
         if self.latest_version == 0 {
@@ -380,7 +386,7 @@ impl SharedTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use native::NativeDevice;
+    use native::{NativeDevice, NativeMemory};
 
     #[test]
     fn it_works() {
@@ -425,6 +431,7 @@ mod tests {
         // shared.write_only(&dev2);
         println!("mem at dev2 {:?}", shared.read(&dev2).unwrap().mem());
         println!("mem at dev3 {:?}", shared.read(&dev3).unwrap().mem());
+        println!("mem at dev3 {:?}", shared.read(&dev3 as &Device<M=NativeMemory>).unwrap().mem());
         // let tmut2 = shared.write_only(&dev);
         assert!(false);
     }
